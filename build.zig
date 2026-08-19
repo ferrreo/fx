@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    const fetch_codex_models = b.option(
+        bool,
+        "fetch-codex-models",
+        "Refresh the Codex model catalog from openai/codex at configure time",
+    ) orelse true;
+    const codex_catalog = resolveCodexCatalog(b, fetch_codex_models);
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -65,6 +71,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    exe.root_module.addImport("codex_catalog", codex_catalog);
 
     b.installArtifact(exe);
 
@@ -91,10 +98,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     if (wasm_surface != .none) {
-        addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+        addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel, codex_catalog);
     }
     if (napi_surface != .none) {
-        addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
+        addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel, codex_catalog);
     }
 
     const mcp_test_exports = b.createModule(.{
@@ -104,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mcp_test_exports.addImport("build_options", build_options.createModule());
+    mcp_test_exports.addImport("codex_catalog", codex_catalog);
     const json_schema_corpus = b.addExecutable(.{
         .name = "json-schema-corpus",
         .root_module = b.createModule(.{
@@ -314,6 +322,7 @@ fn addWasmArtifact(
     git_commit: []const u8,
     app_version: []const u8,
     update_channel: UpdateChannel,
+    codex_catalog: *std.Build.Module,
 ) void {
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -358,6 +367,7 @@ fn addWasmArtifact(
         }),
     });
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    wasm_exe.root_module.addImport("codex_catalog", codex_catalog);
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -372,6 +382,7 @@ fn addNapiArtifact(
     git_commit: []const u8,
     app_version: []const u8,
     update_channel: UpdateChannel,
+    codex_catalog: *std.Build.Module,
 ) void {
     const napi_options = b.addOptions();
     napi_options.addOption([]const u8, "git_commit", git_commit);
@@ -395,6 +406,7 @@ fn addNapiArtifact(
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
+    lib.root_module.addImport("codex_catalog", codex_catalog);
     const node_include = b.option(
         []const u8,
         "node-include-dir",
@@ -419,6 +431,53 @@ fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
     if (code != 0) std.process.fatal("could not locate node_api.h; pass -Dnode-include-dir=<path>", .{});
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
+}
+
+fn resolveCodexCatalog(b: *std.Build, fetch: bool) *std.Build.Module {
+    const catalog_build = @import("scripts/codex_catalog.zig");
+    const catalog = loadCodexCatalog(b, fetch, catalog_build);
+    const generated = catalog_build.generatedZigSource(b.allocator, catalog) catch
+        @panic("could not generate Codex catalog module");
+    const files = b.addWriteFiles();
+    _ = files.add("codex_catalog.json", catalog.json);
+    const zig_file = files.add("codex_catalog.zig", generated);
+    return b.createModule(.{ .root_source_file = zig_file });
+}
+
+fn loadCodexCatalog(b: *std.Build, fetch: bool, comptime catalog_build: type) catalog_build.Catalog {
+    if (fetch) {
+        if (fetchUrl(b, catalog_build.source_url)) |raw| {
+            defer b.allocator.free(raw);
+            if (catalog_build.compact(b.allocator, raw)) |catalog| {
+                return catalog;
+            } else |_| {}
+        }
+    }
+    return loadCodexCatalogSnapshot(b, catalog_build);
+}
+
+fn loadCodexCatalogSnapshot(b: *std.Build, comptime catalog_build: type) catalog_build.Catalog {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        catalog_build.snapshot_path,
+        b.allocator,
+        .limited(256 * 1024),
+    ) catch @panic("could not read Codex catalog snapshot; pass -Dfetch-codex-models=true with network");
+    return catalog_build.fromPickerJson(b.allocator, bytes) catch
+        @panic("Codex catalog snapshot is not valid picker JSON");
+}
+
+fn fetchUrl(b: *std.Build, url: []const u8) ?[]const u8 {
+    var code: u8 = 0;
+    const out = b.runAllowFail(
+        &.{ "curl", "-fsSL", "--max-time", "8", url },
+        &code,
+        .ignore,
+    ) catch return null;
+    if (code != 0) return null;
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return b.allocator.dupe(u8, trimmed) catch null;
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {

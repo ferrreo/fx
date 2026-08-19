@@ -1,0 +1,61 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-5.6-sol",
+      "type": "language",
+      "released": 9999,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max", "ultra"] }]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "type": "language",
+      "released": 9998,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max", "ultra"] }]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "type": "language",
+      "released": 9997,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }]
+    },
+    {
+      "id": "gpt-5.5",
+      "type": "language",
+      "released": 9993,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh"] }]
+    },
+    {
+      "id": "gpt-5.4",
+      "type": "language",
+      "released": 9984,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh"] }]
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "type": "language",
+      "released": 9977,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh"] }]
+    },
+    {
+      "id": "gpt-5.2",
+      "type": "language",
+      "released": 9971,
+      "tags": ["tool-use", "reasoning"],
+      "context_window": 272000,
+      "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh"] }]
+    }
+  ]
+}

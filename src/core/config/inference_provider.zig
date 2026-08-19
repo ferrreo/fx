@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const codex_catalog = @import("codex_catalog");
 
 pub const env_name = "FX_PROVIDER";
 
@@ -46,7 +47,7 @@ pub const openrouter_credits_url = "https://openrouter.ai/api/v1/credits";
 pub const codex_chat_url = "https://chatgpt.com/backend-api/codex/responses";
 
 pub const default_openrouter_model = "openai/gpt-5.2";
-pub const default_codex_model = "gpt-5.3-codex";
+pub const default_codex_model = codex_catalog.default_model;
 
 const Configured = struct {
     mutex: std.Io.Mutex = .init,

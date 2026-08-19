@@ -2121,7 +2121,7 @@ fn fetchModelCatalogResponse(
 
     const kind = inference_provider.resolve();
     if (kind == .codex) {
-        const body = try alloc.dupe(u8, codex_catalog_json);
+        const body = try alloc.dupe(u8, @import("codex_catalog").catalog_json);
         return .{ .success = body };
     }
 
@@ -2145,10 +2145,6 @@ fn fetchModelCatalogResponse(
     else
         gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, catalog_url);
 }
-
-const codex_catalog_json =
-    \\{"object":"list","data":[{"id":"gpt-5.3-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.2-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex-max","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex-mini","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.4","type":"language","tags":["tool-use"]},{"id":"o3","type":"language","tags":["tool-use","reasoning"]},{"id":"codex-mini-latest","type":"language","tags":["tool-use"]}]}
-;
 
 fn modelCatalogTeamPath(
     alloc: Allocator,
@@ -2889,4 +2885,12 @@ test "gateway catalog controls are explicit ordered and bounded" {
     try std.testing.expectEqualStrings("provider/malformed", catalog.items[2].id);
     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+}
+
+test "codex catalog from openai/codex includes the default model" {
+    const catalog = @import("codex_catalog");
+    var ids = try parsePickerModelIds(std.testing.allocator, catalog.catalog_json);
+    defer collections.freeStringList(std.testing.allocator, &ids);
+    try std.testing.expect(ids.items.len > 0);
+    try std.testing.expect(idsContain(ids.items, catalog.default_model));
 }

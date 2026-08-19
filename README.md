@@ -47,7 +47,7 @@ ChatGPT Codex subscription sign-in:
 fx login codex
 ```
 
-That stores tokens in `~/.fx/codex-auth.json` and refreshes them as they expire. Set `FX_PROVIDER=codex` to force that provider.
+That stores tokens in `~/.fx/codex-auth.json` and refreshes them as they expire. Set `FX_PROVIDER=codex` to force that provider. Codex model ids come from [openai/codex](https://github.com/openai/codex) `models-manager/models.json` at `zig build` time (offline builds use the checked-in snapshot).
 
 Run fx from a project:
 

@@ -60,16 +60,19 @@ fn executeOAuthRequest(
     const Header = struct { name: []const u8, value: []const u8 };
     const headers: []const Header = switch (request.method) {
         .get => &.{},
-        .post_form => &.{.{
+        .post_form, .post_json => &.{.{
             .name = "content-type",
-            .value = "application/x-www-form-urlencoded",
+            .value = if (request.method == .post_json)
+                "application/json"
+            else
+                "application/x-www-form-urlencoded",
         }},
     };
     var response = try executeRequest(
         alloc,
         switch (request.method) {
             .get => "GET",
-            .post_form => "POST",
+            .post_form, .post_json => "POST",
         },
         request.url,
         headers,

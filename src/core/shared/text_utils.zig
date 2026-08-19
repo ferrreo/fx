@@ -602,6 +602,7 @@ const secret_prefixes = [_][]const u8{
     "OPENAI_API_KEY=",
     "ANTHROPIC_API_KEY=",
     "AI_GATEWAY_API_KEY=",
+    "OPENROUTER_API_KEY=",
     "VERCEL_OIDC_TOKEN=",
     "GITHUB_TOKEN=",
     "AWS_SECRET_ACCESS_KEY=",

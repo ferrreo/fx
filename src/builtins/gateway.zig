@@ -11,7 +11,10 @@ const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
+const inference_provider = @import("../core/config/inference_provider.zig");
+const openai_compat = @import("../gateway/openai_compat.zig");
 const gateway_client = @import("../gateway/client.zig");
+const codex_session = @import("../core/auth/codex_session.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -150,6 +153,11 @@ pub fn buildAgentRequest(
         null;
     if (budget) |active| try active.check();
 
+    const kind = inference_provider.resolve();
+    if (kind != .ai_gateway) {
+        return buildCompatAgentRequest(alloc, kind, request);
+    }
+
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
             return error.MissingStructuredResponseFormat;
@@ -253,6 +261,34 @@ pub fn buildAgentRequest(
             request.max_output_tokens,
         );
     return finalizeAgentRequestBody(alloc, request.model, try body);
+}
+
+fn buildCompatAgentRequest(
+    alloc: Allocator,
+    kind: inference_provider.Kind,
+    request: agent_stream_provider_contract.BuildRequest,
+) ![]u8 {
+    return switch (kind) {
+        .ai_gateway => unreachable,
+        .openrouter => openai_compat.buildChatCompletionsBody(
+            alloc,
+            request.model,
+            request.serialized_tools,
+            request.messages,
+            request.provider_options,
+            request.tool_choice,
+            request.max_output_tokens,
+        ),
+        .codex => openai_compat.buildResponsesBody(
+            alloc,
+            request.model,
+            request.serialized_tools,
+            request.messages,
+            request.provider_options,
+            request.tool_choice,
+            request.max_output_tokens,
+        ),
+    };
 }
 
 fn finalizeAgentRequestBody(
@@ -425,15 +461,23 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    const kind = inference_provider.resolve();
+    const chat_url = inference_provider.chatUrl(kind, request.chat_url);
+    var session = if (kind == .codex) (codex_session.load(alloc) catch null) else null;
+    defer if (session) |*value| value.deinit(alloc);
+
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
             .api_key = request.api_key,
             .team = request.team,
+            .account_id = if (session) |value| value.account_id else null,
+            .device_id = if (session) |value| value.device_id else null,
+            .protocol = kind.streamProtocol(),
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
-            .chat_url = request.chat_url,
+            .chat_url = chat_url,
             .payload = request.payload,
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
@@ -464,8 +508,8 @@ fn streamAgentCompletion(
         .status = result.status,
         .completion = result.completion,
         .err_body = result.err_body,
-        .generation_origin = gateway_client.generationBaseUrl(),
-        .reconcile_generation_usage = true,
+        .generation_origin = if (kind == .ai_gateway) gateway_client.generationBaseUrl() else "",
+        .reconcile_generation_usage = kind == .ai_gateway,
         .failure_schema = diagnostics.schema,
         .failure_request_shape = diagnostics.request_shape,
         .retry_after_seconds = result.retry_after_seconds,
@@ -609,14 +653,15 @@ const OAuthHttpOperation = struct {
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
-                .post_form => .POST,
+                .post_form, .post_json => .POST,
             },
             .payload = self.request.payload,
             .headers = .{
-                .content_type = if (self.request.method == .post_form)
-                    .{ .override = "application/x-www-form-urlencoded" }
-                else
-                    .default,
+                .content_type = switch (self.request.method) {
+                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
+                    .post_json => .{ .override = "application/json" },
+                    .get => .default,
+                },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
             },
@@ -631,6 +676,7 @@ const OAuthHttpOperation = struct {
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
             .body = try self.alloc.dupe(u8, body),
+            .http_status = result.status,
         };
     }
 };
@@ -2073,23 +2119,36 @@ fn fetchModelCatalogResponse(
         if (flag.load(.seq_cst)) return error.Cancelled;
     }
 
-    const team_path = try modelCatalogTeamPath(alloc, path, access);
-    defer if (team_path) |owned| alloc.free(owned);
+    const kind = inference_provider.resolve();
+    if (kind == .codex) {
+        const body = try alloc.dupe(u8, codex_catalog_json);
+        return .{ .success = body };
+    }
 
-    const model_catalog_url = try modelCatalogUrl(
-        alloc,
-        team_path orelse path,
-        io_mod.getenv(base_url_env),
-    );
-    defer alloc.free(model_catalog_url);
+    const catalog_url = if (kind == .openrouter)
+        try alloc.dupe(u8, inference_provider.openrouter_models_url)
+    else blk: {
+        const team_path = try modelCatalogTeamPath(alloc, path, access);
+        defer if (team_path) |owned| alloc.free(owned);
+        break :blk try modelCatalogUrl(
+            alloc,
+            team_path orelse path,
+            io_mod.getenv(base_url_env),
+        );
+    };
+    defer alloc.free(catalog_url);
 
     const api_key = access.authorizationCredential();
-    const gateway_team = modelCatalogHeaderTeam(access);
+    const gateway_team = if (kind == .openrouter) null else modelCatalogHeaderTeam(access);
     return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
+        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, catalog_url, flag)
     else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, catalog_url);
 }
+
+const codex_catalog_json =
+    \\{"object":"list","data":[{"id":"gpt-5.3-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.2-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex-max","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.1-codex-mini","type":"language","tags":["tool-use","reasoning"]},{"id":"gpt-5.4","type":"language","tags":["tool-use"]},{"id":"o3","type":"language","tags":["tool-use","reasoning"]},{"id":"codex-mini-latest","type":"language","tags":["tool-use"]}]}
+;
 
 fn modelCatalogTeamPath(
     alloc: Allocator,
@@ -2365,11 +2424,24 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
             .integer => value.integer,
             else => 0,
         }
+    else if (entry.object.get("created")) |value|
+        switch (value) {
+            .integer => value.integer,
+            else => 0,
+        }
     else
         0;
 
+    if (openRouterEntryIsNonText(entry.object)) return null;
+
     const tags_value = entry.object.get("tags");
-    const has_tool_use = optionalTagListContains(tags_value, "tool-use");
+    var has_tool_use = optionalTagListContains(tags_value, "tool-use");
+    if (entry.object.get("supported_parameters")) |params| {
+        if (params == .array) {
+            if (!jsonArrayContainsString(params.array.items, "tools")) return null;
+            has_tool_use = true;
+        }
+    }
     var reasoning_efforts = try parseReasoningEfforts(alloc, entry.object.get("reasoning_options"));
     errdefer reasoning_efforts.deinit(alloc);
     const has_reasoning = optionalTagListContains(tags_value, "reasoning") or reasoning_efforts.items.len > 0;
@@ -2380,7 +2452,11 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     const has_explicit_caching = optionalTagListContains(tags_value, "explicit-caching");
     const has_implicit_caching = optionalTagListContains(tags_value, "implicit-caching");
 
-    const context_window = optionalUnsignedU32(entry.object.get("context_window"));
+    const context_window = blk: {
+        const from_window = optionalUnsignedU32(entry.object.get("context_window"));
+        if (from_window != 0) break :blk from_window;
+        break :blk optionalUnsignedU32(entry.object.get("context_length"));
+    };
     const max_tokens = optionalUnsignedU32(entry.object.get("max_tokens"));
     const web_search_price = try parseWebSearchPrice(alloc, entry.object.get("pricing"));
     errdefer if (web_search_price) |value| alloc.free(value);
@@ -2455,6 +2531,26 @@ fn supportsFastMode(entry: std.json.ObjectMap) bool {
     return hasObjectField(objectField(pricing, "service_tiers"), "priority");
 }
 
+fn jsonArrayContainsString(items: []const std.json.Value, needle: []const u8) bool {
+    for (items) |item| {
+        if (item == .string and std.ascii.eqlIgnoreCase(item.string, needle)) return true;
+    }
+    return false;
+}
+
+fn openRouterEntryIsNonText(entry: std.json.ObjectMap) bool {
+    const architecture = entry.get("architecture") orelse return false;
+    if (architecture != .object) return false;
+    if (architecture.object.get("output_modalities")) |outputs| {
+        if (outputs == .array) return !jsonArrayContainsString(outputs.array.items, "text");
+    }
+    const modality = architecture.object.get("modality") orelse return false;
+    if (modality != .string) return false;
+    return std.mem.find(u8, modality.string, "embedding") != null or
+        (std.mem.find(u8, modality.string, "audio") != null and
+            std.mem.find(u8, modality.string, "text") == null);
+}
+
 fn objectField(value: ?std.json.Value, key: []const u8) ?std.json.Value {
     const actual = value orelse return null;
     if (actual != .object) return null;
@@ -2517,6 +2613,33 @@ test "parseSortedModelIds filters non-language entries and surfaces popular mode
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", ids.items[0]);
     try std.testing.expectEqualStrings("openai/gpt-5", ids.items[1]);
     try std.testing.expectEqualStrings("anthropic/claude-haiku-4.5", ids.items[2]);
+}
+
+test "parseSortedModelIds keeps OpenRouter tool models and drops embeddings" {
+    const json_text =
+        \\{"data":[
+        \\  {"id":"openai/gpt-5.2","created":1700000000,"architecture":{"modality":"text->text","output_modalities":["text"]},"supported_parameters":["temperature","tools"],"context_length":128000},
+        \\  {"id":"openai/text-embedding-3-large","created":1700000001,"architecture":{"modality":"text->embedding","output_modalities":["embedding"]},"supported_parameters":["dimensions"]},
+        \\  {"id":"anthropic/claude-sonnet-4","created":1690000000,"architecture":{"output_modalities":["text"]},"supported_parameters":["tools"]}
+        \\]}
+    ;
+
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expect(catalog.items[0].has_tool_use);
+    try std.testing.expect(catalog.items[1].has_tool_use);
+    var saw_gpt = false;
+    var saw_claude = false;
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "openai/gpt-5.2")) {
+            saw_gpt = true;
+            try std.testing.expectEqual(@as(u32, 128000), entry.context_window);
+        }
+        if (std.mem.eql(u8, entry.id, "anthropic/claude-sonnet-4")) saw_claude = true;
+    }
+    try std.testing.expect(saw_gpt);
+    try std.testing.expect(saw_claude);
 }
 
 test "parseSortedModelIds prefers tool-use models over unsupported ones" {

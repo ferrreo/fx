@@ -39,6 +39,16 @@ Or add an AI Gateway API key:
 fx setup
 ```
 
+OpenRouter uses `OPENROUTER_API_KEY`. Optionally set `FX_PROVIDER=openrouter` and `FX_MODEL` to an OpenRouter model id.
+
+ChatGPT Codex subscription sign-in:
+
+```bash
+fx login codex
+```
+
+That stores tokens in `~/.fx/codex-auth.json` and refreshes them as they expire. Set `FX_PROVIDER=codex` to force that provider.
+
 Run fx from a project:
 
 ```bash

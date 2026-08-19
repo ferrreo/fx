@@ -86,14 +86,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login",
-        .summary = "Sign in with Vercel",
+        .usage = "login [vercel|codex]",
+        .summary = "Sign in with Vercel or a ChatGPT Codex subscription",
     },
     .{
         .kind = .logout,
         .token = "logout",
         .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        .summary = "Sign out of Vercel and ChatGPT Codex sessions",
     },
     .{
         .kind = .setup,
@@ -281,7 +281,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login" },
+        .{ .kind = .login, .usage = "login [vercel|codex]" },
         .{ .kind = .logout, .usage = "logout" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
@@ -407,7 +407,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "sign in with Vercel", .presentation_category = .account },
+    .{ .kind = .login, .command = "/login", .help_entry = "/login [codex]", .completion_description = "sign in with Vercel or ChatGPT Codex", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout", .completion_description = "sign out of fx login", .presentation_category = .account },
     .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "set up AI Gateway access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },

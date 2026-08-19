@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const openai_compat = @import("openai_compat.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -519,8 +520,8 @@ fn fetchGatewayJsonAtUrlCore(
         auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
+    var extra_headers_buf: [4]std.http.Header = undefined;
+    const extra_headers = catalogJsonExtraHeaders(&extra_headers_buf, url, gateway_team);
 
     var req = client.request(.GET, uri, .{
         .headers = headers,
@@ -995,6 +996,9 @@ pub const StreamRequest = struct {
     chat_url: []const u8,
     payload: []const u8,
     team: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    device_id: ?[]const u8 = null,
+    protocol: @import("../core/config/inference_provider.zig").StreamProtocol = .ai_sdk,
     /// Borrowed until `streamGatewayCompletion` returns.
     session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
@@ -1177,12 +1181,15 @@ fn streamGatewayCompletionCoreWithOptions(
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer alloc.free(auth_header);
 
-    var extra_headers_buf: [9]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
+    var extra_headers_buf: [12]std.http.Header = undefined;
+    const extra_headers = extraHeadersForProtocol(
         &extra_headers_buf,
+        request.protocol,
         model,
         request.team,
         request.session_id,
+        request.account_id,
+        request.device_id,
     );
 
     var attempt: usize = 0;
@@ -1387,19 +1394,39 @@ fn streamGatewayCompletionCoreWithOptions(
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
-        var completion = consumeSseStreamTraced(
-            alloc,
-            body_reader,
-            callback_ctx,
-            on_content_chunk,
-            on_tool_start,
-            request.on_reasoning_chunk,
-            request.on_tool_input_chunk,
-            cancel_flag,
-            .{ .requested_model = model, .ctx = trace_ctx },
-            expected_provider_tool_name,
-            request.content_capture_limit,
-        ) catch |err| {
+        var completion = switch (request.protocol) {
+            .ai_sdk => consumeSseStreamTraced(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                .{ .requested_model = model, .ctx = trace_ctx },
+                expected_provider_tool_name,
+                request.content_capture_limit,
+            ),
+            .openai_chat => openai_compat.consumeChatCompletionsSse(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                cancel_flag,
+            ),
+            .openai_responses => openai_compat.consumeResponsesSse(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                cancel_flag,
+            ),
+        } catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
                 cancel_flag.load(.seq_cst),
@@ -1456,6 +1483,56 @@ fn streamGatewayCompletionCoreWithOptions(
     return error.HttpConnectionClosing;
 }
 
+fn extraHeadersForProtocol(
+    buf: []std.http.Header,
+    protocol: @import("../core/config/inference_provider.zig").StreamProtocol,
+    model: []const u8,
+    team: ?[]const u8,
+    session_id: ?[]const u8,
+    account_id: ?[]const u8,
+    device_id: ?[]const u8,
+) []const std.http.Header {
+    return switch (protocol) {
+        .ai_sdk => gatewayExtraHeaders(buf, model, team, session_id),
+        .openai_chat => openRouterHeaders(buf),
+        .openai_responses => codexHeaders(buf, account_id, device_id),
+    };
+}
+
+fn openRouterHeaders(buf: []std.http.Header) []const std.http.Header {
+    std.debug.assert(buf.len >= 3);
+    buf[0] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
+    buf[1] = .{ .name = "X-Title", .value = "fx" };
+    buf[2] = .{ .name = "X-OpenRouter-Title", .value = "fx" };
+    return buf[0..3];
+}
+
+fn codexHeaders(
+    buf: []std.http.Header,
+    account_id: ?[]const u8,
+    device_id: ?[]const u8,
+) []const std.http.Header {
+    std.debug.assert(buf.len >= 5);
+    var len: usize = 0;
+    buf[len] = .{ .name = "openai-beta", .value = "responses=experimental" };
+    len += 1;
+    buf[len] = .{ .name = "originator", .value = "codex_cli_rs" };
+    len += 1;
+    if (account_id) |value| {
+        if (value.len > 0) {
+            buf[len] = .{ .name = "chatgpt-account-id", .value = value };
+            len += 1;
+        }
+    }
+    if (device_id) |value| {
+        if (value.len > 0) {
+            buf[len] = .{ .name = "x-oai-device-id", .value = value };
+            len += 1;
+        }
+    }
+    return buf[0..len];
+}
+
 fn gatewayExtraHeaders(
     buf: []std.http.Header,
     model: []const u8,
@@ -1491,6 +1568,17 @@ fn gatewayExtraHeaders(
         }
     }
     return buf[0..len];
+}
+
+fn catalogJsonExtraHeaders(buf: []std.http.Header, url: []const u8, team: ?[]const u8) []const std.http.Header {
+    if (std.mem.startsWith(u8, url, "https://openrouter.ai/")) {
+        std.debug.assert(buf.len >= 3);
+        buf[0] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
+        buf[1] = .{ .name = "X-Title", .value = "fx" };
+        buf[2] = .{ .name = "X-OpenRouter-Title", .value = "fx" };
+        return buf[0..3];
+    }
+    return gatewayModelCatalogExtraHeaders(buf, team);
 }
 
 fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []const std.http.Header {

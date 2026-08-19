@@ -92,6 +92,8 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    openrouter_api_key,
+    codex_login,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {

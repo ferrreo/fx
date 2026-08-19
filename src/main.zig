@@ -906,8 +906,8 @@ const App = struct {
         try AuthAppRuntime.openSetupHub(self);
     }
 
-    pub fn runLoginCommand(self: *App) !void {
-        try AuthAppRuntime.runLoginCommand(self);
+    pub fn runLoginCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLoginCommand(self, rest);
     }
 
     pub fn runLogoutCommand(self: *App) !void {
@@ -3766,6 +3766,10 @@ test {
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/codex_oauth.zig");
+    _ = @import("core/auth/codex_session.zig");
+    _ = @import("core/config/inference_provider.zig");
+    _ = @import("gateway/openai_compat.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/gateway/gateway_json.zig");
     _ = @import("core/github/git_context.zig");

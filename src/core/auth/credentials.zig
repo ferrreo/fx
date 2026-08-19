@@ -3,11 +3,14 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const inference_provider = @import("../config/inference_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+const codex_oauth = @import("codex_oauth.zig");
+const codex_session = @import("codex_session.zig");
 
 pub const Source = types.CredentialSource;
 
@@ -35,6 +38,8 @@ pub const CatalogAuthenticatedSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    openrouter_api_key,
+    codex_login,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -42,6 +47,8 @@ pub const CatalogAuthenticatedSource = enum {
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
+            .openrouter_api_key => .openrouter_api_key,
+            .codex_login => .codex_login,
         };
     }
 };
@@ -105,7 +112,7 @@ pub const CatalogAccess = union(enum) {
 
 pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     const selected = credential orelse return .{ .public_only = .no_credential };
-    if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
+    if ((selected.source == .fx_login or selected.source == .codex_login) and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .fx_login_refresh_required };
     }
     return catalogAccessForCredential(
@@ -133,6 +140,8 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .openrouter_api_key => .openrouter_api_key,
+        .codex_login => .codex_login,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -170,11 +179,15 @@ pub const Credential = struct {
     team_id: ?[]u8 = null,
     team_slug: ?[]u8 = null,
     refresh_after_ms: ?i64 = null,
+    account_id: ?[]u8 = null,
+    device_id: ?[]u8 = null,
 
     pub fn deinit(self: *Credential, alloc: std.mem.Allocator) void {
         secret.zeroAndFree(alloc, self.token);
         if (self.team_id) |team| alloc.free(team);
         if (self.team_slug) |team| alloc.free(team);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.device_id) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -229,19 +242,40 @@ pub fn resolvePreferring(
                 debug_trace.logf("auth", "preferred source load failed source={t} err={s}", .{ source, @errorName(err) });
                 break :blk null;
             };
-            if (chosen) |credential| return .{ .credential = credential };
+            if (chosen) |credential| return remember(credential);
             debug_trace.logf("auth", "preferred source unavailable source={t}; using precedence", .{source});
         }
     }
 
-    if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return .{ .credential = credential };
-    if (try loadSource(alloc, transport, secret_store, .ai_gateway_api_key)) |credential| return .{ .credential = credential };
+    const forced = inference_provider.parse(io_mod.getenv(inference_provider.env_name) orelse "");
+    if (forced == .openrouter) {
+        if (try loadSource(alloc, transport, secret_store, .openrouter_api_key)) |credential| return remember(credential);
+        return .{};
+    }
+    if (forced == .codex) {
+        const codex = switch (mode) {
+            .stored => try loadStoredCodexCredential(alloc),
+            .refresh_if_needed => try loadCodexCredential(alloc, transport),
+        };
+        if (codex) |credential| return remember(credential);
+        return .{};
+    }
+
+    if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return remember(credential);
+    if (try loadSource(alloc, transport, secret_store, .ai_gateway_api_key)) |credential| return remember(credential);
+    if (try loadSource(alloc, transport, secret_store, .openrouter_api_key)) |credential| return remember(credential);
 
     const fx_login = switch (mode) {
         .stored => try loadStoredFxLoginCredential(alloc),
         .refresh_if_needed => try loadFxLoginCredential(alloc, transport),
     };
-    if (fx_login) |credential| return .{ .credential = credential };
+    if (fx_login) |credential| return remember(credential);
+
+    const codex = switch (mode) {
+        .stored => try loadStoredCodexCredential(alloc),
+        .refresh_if_needed => try loadCodexCredential(alloc, transport),
+    };
+    if (codex) |credential| return remember(credential);
 
     if (secret_store.isDisabled()) return .{};
 
@@ -252,8 +286,13 @@ pub fn resolvePreferring(
         debug_trace.logf("auth", "stored key load failed err={s} status={t}", .{ @errorName(err), status });
         break :blk null;
     };
-    if (stored) |credential| return .{ .credential = credential };
+    if (stored) |credential| return remember(credential);
     return .{ .stored_key_status = status };
+}
+
+fn remember(credential: Credential) Resolution {
+    inference_provider.setConfigured(inference_provider.Kind.fromCredentialSource(credential.source));
+    return .{ .credential = credential };
 }
 
 /// `loadSource` always refreshes an expired fx login, which `.stored` mode
@@ -266,6 +305,12 @@ fn loadPreferredSource(
     mode: LoadMode,
     source: Source,
 ) !?Credential {
+    if (source == .codex_login) {
+        return switch (mode) {
+            .stored => loadStoredCodexCredential(alloc),
+            .refresh_if_needed => loadCodexCredential(alloc, transport),
+        };
+    }
     if (source != .fx_login) return loadSource(alloc, transport, secret_store, source);
     return switch (mode) {
         .stored => loadStoredFxLoginCredential(alloc),
@@ -282,7 +327,9 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        .openrouter_api_key => loadEnvCredential(alloc, "OPENROUTER_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
+        .codex_login => loadCodexCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
     };
 }
@@ -295,11 +342,24 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .openrouter_api_key => nonEmptyEnvValue("OPENROUTER_API_KEY") != null,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     debug_trace.logf("auth", "source probe failed source=fx_login err={s}", .{@errorName(err)});
+                    break :blk false;
+                },
+            };
+            var session = loaded orelse break :blk false;
+            defer session.deinit(alloc);
+            break :blk true;
+        },
+        .codex_login => blk: {
+            const loaded = codex_session.load(alloc) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    debug_trace.logf("auth", "source probe failed source=codex_login err={s}", .{@errorName(err)});
                     break :blk false;
                 },
             };
@@ -458,6 +518,77 @@ fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?
     };
 }
 
+pub fn loadCodexCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    var session = (try codex_session.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+    if (session.expired(io_mod.milliTimestamp())) {
+        return refreshCodexCredentialLocked(alloc, transport, .if_needed);
+    }
+    return takeCredentialFromCodexSession(&session, null);
+}
+
+fn loadStoredCodexCredential(alloc: std.mem.Allocator) !?Credential {
+    var session = (try codex_session.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+    return takeCredentialFromCodexSession(&session, null);
+}
+
+pub fn refreshCodexCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    return refreshCodexCredentialLocked(alloc, transport, .force);
+}
+
+fn refreshCodexCredentialLocked(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: FxLoginRefreshMode,
+) !?Credential {
+    var mutation = (try codex_session.beginExistingMutation()) orelse return null;
+    defer mutation.deinit();
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+
+    var refreshed_at_ms: ?i64 = null;
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        var tokens = try codex_oauth.refreshTokens(alloc, transport, session.refresh_token);
+        defer tokens.deinit(alloc);
+        secret.zeroAndFree(alloc, session.access_token);
+        session.access_token = tokens.access_token;
+        tokens.access_token = &.{};
+        secret.zeroAndFree(alloc, session.refresh_token);
+        session.refresh_token = tokens.refresh_token;
+        tokens.refresh_token = &.{};
+        session.expires_at_ms = try oauth.expiry_timestamp_ms(io_mod.milliTimestamp(), tokens.expires_in);
+        if (session.account_id == null) {
+            session.account_id = try codex_oauth.extractAccountId(alloc, session.access_token);
+        }
+        try mutation.save(alloc, session);
+        refreshed_at_ms = io_mod.milliTimestamp();
+    }
+    return takeCredentialFromCodexSession(&session, refreshed_at_ms);
+}
+
+fn takeCredentialFromCodexSession(session: *codex_session.Session, refreshed_at_ms: ?i64) Credential {
+    const token = session.access_token;
+    session.access_token = &.{};
+    const account_id = session.account_id;
+    session.account_id = null;
+    const device_id = session.device_id;
+    session.device_id = null;
+    return .{
+        .token = token,
+        .source = .codex_login,
+        .refresh_after_ms = credentialRefreshAfterMs(session.expires_at_ms, refreshed_at_ms),
+        .account_id = account_id,
+        .device_id = device_id,
+    };
+}
+
 fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
     const refresh_after_ms = oauth_session.refresh_deadline_ms(expires_at_ms);
     const refreshed_at = refreshed_at_ms orelse return refresh_after_ms;
@@ -469,13 +600,15 @@ pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
+        .openrouter_api_key => "OPENROUTER_API_KEY",
         .fx_login => "fx login",
+        .codex_login => "ChatGPT Codex",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login;
+    return source == .fx_login or source == .codex_login;
 }
 
 test "stored key label discloses the backend that answered" {

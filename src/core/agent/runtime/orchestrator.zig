@@ -1400,7 +1400,7 @@ fn refreshGatewayCredentialForJob(
     trace_ctx: TraceContext,
 ) !bool {
     const source = job.credential_source orelse return false;
-    if (source != .fx_login) return false;
+    if (source != .fx_login and source != .codex_login) return false;
     const refresh = deps.refresh_gateway_credential orelse return false;
 
     const refreshed = refresh(deps.ctx, alloc, source, mode) catch |err| {

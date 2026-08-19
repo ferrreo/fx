@@ -1773,7 +1773,12 @@ test "partially visible auth picker shows a source window without duplicates" {
     const alloc = std.testing.allocator;
     const view = auth_runtime.PickerView{
         .active = true,
-        .available_sources = auth_runtime.SourceSet.full,
+        .available_sources = auth_runtime.SourceSet.initMany(&.{
+            .vercel_oidc_token,
+            .ai_gateway_api_key,
+            .fx_login,
+            .stored_key,
+        }),
         .selected_choice = .{ .source = .fx_login },
         .active_source = .vercel_oidc_token,
         .include_skip = false,

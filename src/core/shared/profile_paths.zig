@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 pub const root_dir_name = ".fx";
 pub const auth_file_name = "auth.json";
+pub const codex_auth_file_name = "codex-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
 pub const prompt_history_file_name = "history.jsonl";

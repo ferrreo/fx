@@ -7,11 +7,21 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const codex_oauth = @import("../auth/codex_oauth.zig");
+const codex_session = @import("../auth/codex_session.zig");
+const inference_provider = @import("../config/inference_provider.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
         runtime_profile.allows(App, .js_host_auth);
+}
+
+fn deleteCodexSession() bool {
+    var mutation = (codex_session.beginExistingMutation() catch return false) orelse return false;
+    defer mutation.deinit();
+    const outcome = mutation.delete() catch return false;
+    return outcome == .deleted or outcome == .deleted_not_durable;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -34,13 +44,41 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        pub fn runLoginCommand(app: *App) !void {
+        pub fn runLoginCommand(app: *App, rest: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
                     .body = "Set FX_API_KEY through createFxTerminal() to authenticate this WASM session.",
                 }, true);
+                return;
+            }
+            const target = std.mem.trim(u8, rest, " \t");
+            if (std.ascii.eqlIgnoreCase(target, "codex") or std.ascii.eqlIgnoreCase(target, "chatgpt")) {
+                try app.flushBeforeBlockingExternalWork();
+                inference_provider.setConfigured(.codex);
+                codex_oauth.runDeviceLogin(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    app.urlOpener(),
+                ) catch |err| {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "ChatGPT Codex sign-in failed. Run /login codex to try again.",
+                    });
+                    debug_trace.logf("auth", "codex login failed err={s}", .{@errorName(err)});
+                    return;
+                };
+                rememberCredentialSource(app, .codex_login);
+                try app.auth.refreshSourceInventory(app.alloc);
+                const changed = (try app.auth.selectSource(app.alloc, .codex_login)) orelse false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "Signed in to ChatGPT Codex.",
+                });
                 return;
             }
             try beginSignIn(app, false);
@@ -66,7 +104,8 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
             };
-            try applyLogoutResult(app, result);
+            const deleted_codex = deleteCodexSession();
+            try applyLogoutResult(app, result, deleted_codex);
         }
 
         pub fn openSetupHub(app: *App) !void {
@@ -83,13 +122,14 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
+        fn applyLogoutResult(app: *App, result: login_flow.LogoutResult, deleted_codex: bool) !void {
             // Logging out is an explicit rejection of that credential, so a
             // remembered pointer to it would silently reactivate on next login.
             // A remembered source always wins resolution, so an active fx login
             // is the only way one can be remembered; clearing otherwise is a
             // no-op against a store that holds nothing.
-            if (app.auth.credentialSource() == .fx_login) forgetCredentialSource(app);
+            const source = app.auth.credentialSource();
+            if (source == .fx_login or source == .codex_login) forgetCredentialSource(app);
             applyCredentialChange(app, try app.auth.reconcileAfterFxLoginLogout(app.alloc));
             try writeAuthNotice(app, if (result.local_durability_failed)
                 .{
@@ -97,7 +137,7 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = "Could not confirm durable fx logout. The active source was recalculated.",
                 }
-            else if (result.session_deleted)
+            else if (result.session_deleted or deleted_codex)
                 .{
                     .topic = "auth",
                     .tone = .neutral,
@@ -557,9 +597,22 @@ pub fn Runtime(comptime App: type) type {
         fn applyCredentialChange(app: *App, changed: bool) void {
             if (!changed) return;
             reconcileGatewayCredential(app);
+            retargetModelForProvider(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
+            }
+        }
+
+        fn retargetModelForProvider(app: *App) void {
+            if (comptime !@hasField(App, "selected_model")) return;
+            const kind = inference_provider.resolve();
+            if (inference_provider.modelFits(kind, app.selected_model.items)) return;
+            const next = inference_provider.defaultModel(kind, app.selected_model.items);
+            app.selected_model.clearRetainingCapacity();
+            app.selected_model.appendSlice(app.alloc, next) catch return;
+            if (comptime @hasDecl(App, "terminalTitle")) {
+                app.terminalTitle().setModel(app.selected_model.items);
             }
         }
 
@@ -1135,7 +1188,7 @@ test "logout result reconciles live auth and renders only sanitized notices" {
     try Runtime(TestApp).applyLogoutResult(&app, .{
         .session_deleted = true,
         .remote_revocation_failed = true,
-    });
+    }, false);
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
@@ -1156,7 +1209,7 @@ test "logout durability failure still reconciles live auth" {
         .session_deleted = true,
         .local_durability_failed = true,
         .remote_revocation_failed = true,
-    });
+    }, false);
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);

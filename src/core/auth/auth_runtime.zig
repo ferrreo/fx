@@ -21,7 +21,9 @@ pub const CredentialRefreshMode = enum {
 const credential_source_order = [_]credentials.Source{
     .vercel_oidc_token,
     .ai_gateway_api_key,
+    .openrouter_api_key,
     .fx_login,
+    .codex_login,
     .stored_key,
 };
 
@@ -103,11 +105,18 @@ pub fn refreshFxLoginToken(
     source: credentials.Source,
     mode: CredentialRefreshMode,
 ) !?[]u8 {
-    if (source != .fx_login) return null;
+    if (source != .fx_login and source != .codex_login) return null;
 
-    var credential = switch (mode) {
-        .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
-        .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+    var credential = switch (source) {
+        .fx_login => switch (mode) {
+            .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
+            .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+        },
+        .codex_login => switch (mode) {
+            .if_needed => (try credentials.loadCodexCredential(alloc, transport)) orelse return null,
+            .force => (try credentials.refreshCodexCredential(alloc, transport)) orelse return null,
+        },
+        else => return null,
     };
     defer credential.deinit(alloc);
 
@@ -1122,9 +1131,13 @@ pub const Runtime = struct {
 
     pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {
         const source = self.credentialSource() orelse return false;
-        if (source != .fx_login) return false;
+        if (source != .fx_login and source != .codex_login) return false;
 
-        const loaded = (try credentials.loadFxLoginCredential(alloc, self.oauth_transport)) orelse {
+        const loaded = switch (source) {
+            .fx_login => (try credentials.loadFxLoginCredential(alloc, self.oauth_transport)),
+            .codex_login => (try credentials.loadCodexCredential(alloc, self.oauth_transport)),
+            else => return false,
+        } orelse {
             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
             return false;
         };

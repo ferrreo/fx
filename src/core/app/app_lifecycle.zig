@@ -4,6 +4,7 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const inference_provider = @import("../config/inference_provider.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
@@ -403,6 +404,7 @@ fn loadStartupStateFromOwnedWorkspace(
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }
+    try retargetStartupModel(alloc, &state, default_model);
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
@@ -1091,6 +1093,16 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
         fallback,
         io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
+}
+
+fn retargetStartupModel(alloc: Allocator, state: *StartupState, default_model: []const u8) !void {
+    if (hasProcessModelOverride()) return;
+    const source = if (state.credential) |credential| credential.source else return;
+    const kind = inference_provider.resolveFromEnvAndSource(source);
+    if (inference_provider.modelFits(kind, state.selected_model)) return;
+    const next = inference_provider.defaultModel(kind, default_model);
+    alloc.free(state.selected_model);
+    state.selected_model = try alloc.dupe(u8, next);
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {

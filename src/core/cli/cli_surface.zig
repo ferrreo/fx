@@ -21,6 +21,9 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const codex_oauth = @import("../auth/codex_oauth.zig");
+const codex_session = @import("../auth/codex_session.zig");
+const inference_provider = @import("../config/inference_provider.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -707,8 +710,31 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
+            if (rest.len > 1) {
+                try writeStderr(deps, "usage: fx login [vercel|codex]\n");
+                return .handled_failure;
+            }
+            const target = if (rest.len == 1) rest[0] else "vercel";
+            if (std.ascii.eqlIgnoreCase(target, "codex") or std.ascii.eqlIgnoreCase(target, "chatgpt")) {
+                inference_provider.setConfigured(.codex);
+                codex_oauth.runDeviceLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.AccessDenied => "fx login: ChatGPT authorization denied\n",
+                        error.LoginTimedOut, error.ExpiredToken => "fx login: ChatGPT authorization expired; run fx login codex again\n",
+                        else => "fx login: failed to sign in to ChatGPT Codex\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                persistPreferredCredentialSource(alloc, .codex_login);
+                return .handled_success;
+            }
+            if (!std.ascii.eqlIgnoreCase(target, "vercel") and !std.ascii.eqlIgnoreCase(target, "gateway")) {
+                try writeStderr(deps, "usage: fx login [vercel|codex]\n");
                 return .handled_failure;
             }
             login_flow.runLogin(
@@ -738,12 +764,14 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
+            const deleted_codex = deleteCodexSession();
             if (result.local_durability_failed) {
                 try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
             } else {
+                const signed_out = result.session_deleted or deleted_codex;
                 try writeStdout(
                     deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                    if (signed_out) "Signed out of fx.\n" else "No fx login session found.\n",
                 );
             }
             if (result.remote_revocation_failed) {
@@ -1448,6 +1476,22 @@ fn runGithubWorkflow(
     try writeStdout(deps, published.text);
     try writeStdout(deps, "\n");
     return .handled_success;
+}
+
+fn persistPreferredCredentialSource(alloc: Allocator, source: types.CredentialSource) void {
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{ .credential_source = source });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .outcome => {},
+        .failure => {},
+    }
+}
+
+fn deleteCodexSession() bool {
+    var mutation = (codex_session.beginExistingMutation() catch return false) orelse return false;
+    defer mutation.deinit();
+    const outcome = mutation.delete() catch return false;
+    return outcome == .deleted or outcome == .deleted_not_durable;
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
